@@ -1,0 +1,192 @@
+version: 2
+jobs:
+  build:
+    working_directory: ~/frontend
+    docker:
+      - image: circleci/node:10.6.0-browsers
+    steps:
+      - checkout
+
+      - run:
+          name: Installing deployment dependencies
+          working_directory: /
+          command: |
+            sudo apt-get -y -qq update
+            sudo apt-get install python-pip python-dev build-essential
+            sudo pip install awscli --upgrade
+
+      - run:
+          name: Building
+          command: |
+            if [ "${CIRCLE_BRANCH}" == "master" ]; then
+              # Print the env vars and output it to a file so that during build, the vars are interpolated
+              aws s3 cp s3://my-test-env-files/frontend/.env.production .env.production
+              npm install
+              npm run build-production
+            elif [ "${CIRCLE_BRANCH}" == "staging" ] || [ "${CIRCLE_BRANCH}" == "rc" ]; then
+              # Print the env vars and output it to a file so that during build, the vars are interpolated
+              aws s3 cp s3://my-test-bucket-env-files/frontend/.env.staging .env.staging
+              npm install
+              npm run build-staging
+            else
+              # Print the env vars and output it to a file so that during build, the vars are interpolated
+              aws s3 cp s3://my-test-bucket-env-files/frontend/.env.dev .env.dev
+              npm install
+              npm run build-dev
+            fi
+
+            cd ./build
+
+            # Remove any bundle script tag dependencies in index.html, 
+            if [ "${CIRCLE_BRANCH}" == "master" ]; then
+              sed -i 's/<script.*src="\/[1-9][0-9]*\.[a-z1-9][a-z0-9]*\.bundle\.js".*<\/script>//g' index.html
+            fi
+
+            # gzip the js files, and remove the gz extensions.
+            for file in *.js* ; do gzip "$file" ; done
+            for file in *.gz ; do mv "$file" "${file%.*}" ; done
+
+      - run:
+          name: Deploying
+          command: |
+            BUCKET_NAME=""
+            BUCKET_REGION="us-west-1"
+            if [ "${CIRCLE_BRANCH}" == "master" ]; then
+              BUCKET_NAME="s3://my-test-bucket"
+            elif [ "${CIRCLE_BRANCH}" == "staging" ] || [ "${CIRCLE_BRANCH}" == "rc" ]; then
+              BUCKET_NAME="s3://my-test-bucket"
+            elif [ "${CIRCLE_BRANCH}" == "development" ]; then
+              BUCKET_NAME="s3://my-test-bucket-dev"
+            fi
+
+            if [ "$BUCKET_NAME" == "" ]; then
+              echo "No need to deploy"
+            else
+              # Specify the cache policy and to delete files in the bucket if !exist locally
+              aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+              --exclude "*" \
+              --include "*.html" --include "*.htm" \
+              --cache-control max-age=0,no-cache,no-store,must-revalidate --expires 0
+              aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+              --exclude "*" \
+              --include "*.xml" \
+              --include "*.txt" \
+              --cache-control max-age=60
+              aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+              --exclude "*" \
+              --include "images/*" --cache-control max-age=604800
+              aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+              --exclude "*" \
+              --include "*.js" \
+              --include "*.map" \
+              --cache-control max-age=604800 --content-encoding gzip
+
+              # Copy the index.html, rename to the parent directory, and move to the parent directory
+              # Not needed because we only prerender '/' right now
+              if [ "${CIRCLE_BRANCH}" == "master" ]; then
+                for file in $(find ./build -name "index.html"); do
+                  if [ "$file" != "./build/index.html" ]; then
+                    aws s3 cp "$file" "$BUCKET_NAME$(echo "$file" | sed -r 's/^.\/build(.*)?\/(.*)\/index.html$/\1\/\2/g')" --cache-control max-age=0,no-cache,no-store,must-revalidate --expires 0
+                  fi
+                done
+              fi
+            fi
+
+      - add_ssh_keys:
+          fingerprints:
+            # For GitHub to have write access
+            - "de:88:2a:75:e9:3c:c3:bc:58:dd:d0:8f:2a:33:e9:4e"
+
+      - run:
+          name: Git Tagging
+          command: |
+            if [ "${CIRCLE_BRANCH}" == "master" ] || [ "${CIRCLE_BRANCH}" == "staging" ] || [ "${CIRCLE_BRANCH}" == "development" ] || [ "${CIRCLE_BRANCH}" == "rc" ]; then
+              git fetch --tags
+              git tag ${CIRCLE_BRANCH}-`date +%F_%H-%M-%S`
+              git push origin --tags
+            else
+              echo "No need to git-tag"
+            fi
+
+  nightlybuild:
+    working_directory: ~/frontend
+    docker:
+      - image: circleci/node:10.6.0-browsers
+    steps:
+      - checkout
+
+      - run:
+          name: Installing deployment dependencies
+          working_directory: /
+          command: |
+            sudo apt-get -y -qq update
+            sudo apt-get install python-pip python-dev build-essential
+            sudo pip install awscli --upgrade
+
+      - run:
+          name: Building
+          command: |
+            aws s3 cp s3://my-test-secret-env-files/frontend/.env.qa .env.qa
+            npm install
+            npm run build-qa
+
+            cd ./build
+
+            # gzip the js files, and remove the gz extensions.
+            for file in *.js* ; do gzip "$file" ; done
+            for file in *.gz ; do mv "$file" "${file%.*}" ; done
+
+      - run:
+          name: Deploying
+          command: |
+            BUCKET_NAME="s3://my-test-bucket"
+            BUCKET_REGION="ap-south-1"
+
+            # Specify the cache policy and to delete files in the bucket if !exist locally
+            aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+            --exclude "*" \
+            --include "*.html" --include "*.htm" \
+            --cache-control max-age=0,no-cache,no-store,must-revalidate --expires 0
+            aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+            --exclude "*" \
+            --include "*.xml" \
+            --include "*.txt" \
+            --cache-control max-age=60
+            aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+            --exclude "*" \
+            --include "images/*" --cache-control max-age=604800
+            aws s3 sync ./build $BUCKET_NAME --region $BUCKET_REGION --delete \
+            --exclude "*" \
+            --include "*.js" \
+            --include "*.map" \
+            --cache-control max-age=604800 --content-encoding gzip
+
+      - add_ssh_keys:
+          fingerprints:
+            # For GitHub to have write access
+            - "de:88:2a:75:e9:3c:c3:bc:58:dd:d0:8f:2a:33:e9:4e"
+
+      - run:
+          name: Git Tagging
+          command: |
+            git fetch --tags
+            git tag qa-`date +%F_%H-%M-%S`
+            git push origin --tags
+
+
+# Run at 3AM UTC M-F. Format is http://pubs.opengroup.org/onlinepubs/7908799/xcu/crontab.html
+workflows:
+  version: 2
+  commit:
+    jobs:
+      - build
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 3 * * 1-5"
+          filters:
+            branches:
+              only:
+                - development
+    jobs:
+      - nightlybuild
